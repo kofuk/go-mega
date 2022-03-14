@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"math/big"
 	mrand "math/rand"
 	"net/http"
@@ -39,20 +38,20 @@ const (
 )
 
 type config struct {
-	baseurl    string
-	retries    int
-	dl_workers int
-	ul_workers int
-	timeout    time.Duration
+	baseurl   string
+	retries   int
+	dlWorkers int
+	ulWorkers int
+	timeout   time.Duration
 }
 
 func newConfig() config {
 	return config{
-		baseurl:    API_URL,
-		retries:    RETRIES,
-		dl_workers: DOWNLOAD_WORKERS,
-		ul_workers: UPLOAD_WORKERS,
-		timeout:    TIMEOUT,
+		baseurl:   API_URL,
+		retries:   RETRIES,
+		dlWorkers: DOWNLOAD_WORKERS,
+		ulWorkers: UPLOAD_WORKERS,
+		timeout:   TIMEOUT,
 	}
 }
 
@@ -72,7 +71,7 @@ func (c *config) SetRetries(r int) {
 // Set concurrent download workers
 func (c *config) SetDownloadWorkers(w int) error {
 	if w <= MAX_DOWNLOAD_WORKERS {
-		c.dl_workers = w
+		c.dlWorkers = w
 		return nil
 	}
 
@@ -87,7 +86,7 @@ func (c *config) SetTimeOut(t time.Duration) {
 // Set concurrent upload workers
 func (c *config) SetUploadWorkers(w int) error {
 	if w <= MAX_UPLOAD_WORKERS {
-		c.ul_workers = w
+		c.ulWorkers = w
 		return nil
 	}
 
@@ -127,11 +126,11 @@ type Mega struct {
 
 // Filesystem node types
 const (
-	FILE   = 0
-	FOLDER = 1
-	ROOT   = 2
-	INBOX  = 3
-	TRASH  = 4
+	TypeFile   = 0
+	TypeFolder = 1
+	TypeRoot   = 2
+	TypeInbox  = 3
+	TypeTrash  = 4
 )
 
 // Filesystem node
@@ -348,7 +347,7 @@ func New() *Mega {
 		FS:     mgfs,
 		client: newHttpClient(cfg.timeout),
 	}
-	m.SetLogger(log.Printf)
+	m.SetLogger(nil)
 	m.SetDebugger(nil)
 	return m
 }
@@ -396,7 +395,7 @@ func backOffSleep(pt *time.Duration) {
 }
 
 // API request method
-func (m *Mega) api_request(r []byte) (buf []byte, err error) {
+func (m *Mega) requestAPI(r []byte) (buf []byte, err error) {
 	var resp *http.Response
 	// serialize the API requests
 	m.apiMu.Lock()
@@ -481,7 +480,7 @@ func (m *Mega) prelogin(email string) error {
 	if err != nil {
 		return err
 	}
-	result, err := m.api_request(req)
+	result, err := m.requestAPI(req)
 	if err != nil {
 		return err
 	}
@@ -552,7 +551,7 @@ func (m *Mega) login(email string, passwd string) error {
 	if err != nil {
 		return err
 	}
-	result, err = m.api_request(req)
+	result, err = m.requestAPI(req)
 	if err != nil {
 		return err
 	}
@@ -578,6 +577,22 @@ func (m *Mega) login(email string, passwd string) error {
 	return nil
 }
 
+func (m *Mega) logout() error {
+	var msg UserMsg
+	msg.Cmd = "smi"
+
+	req, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+
+	if _, err := m.requestAPI(req); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // Authenticate and start a session
 func (m *Mega) Login(email string, passwd string) error {
 	err := m.prelogin(email)
@@ -590,61 +605,22 @@ func (m *Mega) Login(email string, passwd string) error {
 		return err
 	}
 
-	waitEvent := m.WaitEventsStart()
-
 	err = m.getFileSystem()
 	if err != nil {
 		return err
 	}
 
-	// Wait until the all the pending events have been received
-	m.WaitEvents(waitEvent, 5*time.Second)
-
 	return nil
 }
 
-// WaitEventsStart - call this before you do the action which might
-// generate events then use the returned channel as a parameter to
-// WaitEvents to wait for the event(s) to be received.
-func (m *Mega) WaitEventsStart() <-chan struct{} {
-	ch := make(chan struct{})
-	m.waitEventsMu.Lock()
-	m.waitEvents = append(m.waitEvents, ch)
-	m.waitEventsMu.Unlock()
-	return ch
-}
-
-// WaitEvents waits for all outstanding events to be received for a
-// maximum of duration.  eventChan should be a channel as returned
-// from WaitEventStart.
-//
-// If the timeout elapsed then it returns true otherwise false.
-func (m *Mega) WaitEvents(eventChan <-chan struct{}, duration time.Duration) (timedout bool) {
-	m.debugf("Waiting for events to be finished for %v", duration)
-	timer := time.NewTimer(duration)
-	select {
-	case <-eventChan:
-		m.debugf("Events received")
-		timedout = false
-	case <-timer.C:
-		m.debugf("Timeout waiting for events")
-		timedout = true
+func (m *Mega) Logout() error {
+	if err := m.logout(); err != nil {
+		return err
 	}
-	timer.Stop()
-	return timedout
-}
 
-// waitEventsFire - fire the wait event
-func (m *Mega) waitEventsFire() {
-	m.waitEventsMu.Lock()
-	if len(m.waitEvents) > 0 {
-		m.debugf("Signalling events received")
-		for _, ch := range m.waitEvents {
-			close(ch)
-		}
-		m.waitEvents = nil
-	}
-	m.waitEventsMu.Unlock()
+	m.sid = ""
+
+	return nil
 }
 
 // Get user information
@@ -658,7 +634,7 @@ func (m *Mega) GetUser() (UserResp, error) {
 	if err != nil {
 		return res[0], err
 	}
-	result, err := m.api_request(req)
+	result, err := m.requestAPI(req)
 	if err != nil {
 		return res[0], err
 	}
@@ -680,7 +656,7 @@ func (m *Mega) GetQuota() (QuotaResp, error) {
 	if err != nil {
 		return res[0], err
 	}
-	result, err := m.api_request(req)
+	result, err := m.requestAPI(req)
 	if err != nil {
 		return res[0], err
 	}
@@ -702,7 +678,7 @@ func (m *Mega) addFSNode(itm FSNode) (*Node, error) {
 	}
 
 	switch {
-	case itm.T == FOLDER || itm.T == FILE:
+	case itm.T == TypeFolder || itm.T == TypeFile:
 		args := strings.Split(itm.Key, ":")
 		if len(args) < 2 {
 			return nil, fmt.Errorf("not enough : in item.Key: %q", itm.Key)
@@ -790,7 +766,7 @@ func (m *Mega) addFSNode(itm FSNode) (*Node, error) {
 		}
 
 		switch {
-		case itm.T == FILE:
+		case itm.T == TypeFile:
 			if len(compkey) < 8 {
 				m.logf("ignoring item: compkey too short (%d): %#v", len(compkey), itm)
 				return nil, nil
@@ -840,14 +816,14 @@ func (m *Mega) addFSNode(itm FSNode) (*Node, error) {
 			parent = &Node{
 				fs:       m.FS,
 				children: []*Node{node},
-				ntype:    FOLDER,
+				ntype:    TypeFolder,
 			}
 			m.FS.lookup[itm.Parent] = parent
 		}
 	}
 
 	switch {
-	case itm.T == FILE:
+	case itm.T == TypeFile:
 		var meta NodeMeta
 		meta.key, err = a32_to_bytes(key)
 		if err != nil {
@@ -866,7 +842,7 @@ func (m *Mega) addFSNode(itm FSNode) (*Node, error) {
 			return nil, err
 		}
 		node.meta = meta
-	case itm.T == FOLDER:
+	case itm.T == TypeFolder:
 		var meta NodeMeta
 		meta.key, err = a32_to_bytes(key)
 		if err != nil {
@@ -877,13 +853,13 @@ func (m *Mega) addFSNode(itm FSNode) (*Node, error) {
 			return nil, err
 		}
 		node.meta = meta
-	case itm.T == ROOT:
+	case itm.T == TypeRoot:
 		attr.Name = "Cloud Drive"
 		m.FS.root = node
-	case itm.T == INBOX:
+	case itm.T == TypeInbox:
 		attr.Name = "InBox"
 		m.FS.inbox = node
-	case itm.T == TRASH:
+	case itm.T == TypeTrash:
 		attr.Name = "Trash"
 		m.FS.trash = node
 	}
@@ -916,7 +892,7 @@ func (m *Mega) getFileSystem() error {
 	if err != nil {
 		return err
 	}
-	result, err := m.api_request(req)
+	result, err := m.requestAPI(req)
 	if err != nil {
 		return err
 	}
@@ -939,8 +915,6 @@ func (m *Mega) getFileSystem() error {
 	}
 
 	m.ssn = res[0].Sn
-
-	go m.pollEvents()
 
 	return nil
 }
@@ -985,7 +959,7 @@ func (m *Mega) NewDownload(src *Node) (*Download, error) {
 	if err != nil {
 		return nil, err
 	}
-	result, err := m.api_request(request)
+	result, err := m.requestAPI(request)
 	if err != nil {
 		return nil, err
 	}
@@ -1196,11 +1170,11 @@ func (m *Mega) DownloadFile(src *Node, dstpath string, progress *chan int) error
 	}
 
 	workch := make(chan int)
-	errch := make(chan error, m.dl_workers)
+	errch := make(chan error, m.dlWorkers)
 	wg := sync.WaitGroup{}
 
 	// Fire chunk download workers
-	for w := 0; w < m.dl_workers; w++ {
+	for w := 0; w < m.dlWorkers; w++ {
 		wg.Add(1)
 
 		go func() {
@@ -1297,7 +1271,7 @@ func (m *Mega) NewUpload(parent *Node, name string, fileSize int64) (*Upload, er
 	if err != nil {
 		return nil, err
 	}
-	result, err := m.api_request(request)
+	result, err := m.requestAPI(request)
 	if err != nil {
 		return nil, err
 	}
@@ -1505,7 +1479,7 @@ func (u *Upload) Finish() (node *Node, err error) {
 	cmsg[0].Cmd = "p"
 	cmsg[0].T = u.parenthash
 	cmsg[0].N[0].H = string(u.completion_handle)
-	cmsg[0].N[0].T = FILE
+	cmsg[0].N[0].T = TypeFile
 	cmsg[0].N[0].A = attr_data
 	cmsg[0].N[0].K = base64urlencode(buf)
 
@@ -1513,7 +1487,7 @@ func (u *Upload) Finish() (node *Node, err error) {
 	if err != nil {
 		return nil, err
 	}
-	result, err := u.m.api_request(request)
+	result, err := u.m.requestAPI(request)
 	if err != nil {
 		return nil, err
 	}
@@ -1565,11 +1539,11 @@ func (m *Mega) UploadFile(srcpath string, parent *Node, name string, progress *c
 	}
 
 	workch := make(chan int)
-	errch := make(chan error, m.ul_workers)
+	errch := make(chan error, m.ulWorkers)
 	wg := sync.WaitGroup{}
 
 	// Fire chunk upload workers
-	for w := 0; w < m.ul_workers; w++ {
+	for w := 0; w < m.ulWorkers; w++ {
 		wg.Add(1)
 
 		go func() {
@@ -1649,7 +1623,7 @@ func (m *Mega) Move(src *Node, parent *Node) error {
 	if err != nil {
 		return err
 	}
-	_, err = m.api_request(request)
+	_, err = m.requestAPI(request)
 	if err != nil {
 		return err
 	}
@@ -1702,7 +1676,7 @@ func (m *Mega) Rename(src *Node, name string) error {
 	if err != nil {
 		return err
 	}
-	_, err = m.api_request(req)
+	_, err = m.requestAPI(req)
 	if err != nil {
 		return err
 	}
@@ -1750,7 +1724,7 @@ func (m *Mega) CreateDir(name string, parent *Node) (*Node, error) {
 	msg[0].Cmd = "p"
 	msg[0].T = parent.hash
 	msg[0].N[0].H = "xxxxxxxx"
-	msg[0].N[0].T = FOLDER
+	msg[0].N[0].T = TypeFolder
 	msg[0].N[0].A = attr_data
 	msg[0].N[0].K = base64urlencode(key)
 	msg[0].I, err = randString(10)
@@ -1762,7 +1736,7 @@ func (m *Mega) CreateDir(name string, parent *Node) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	result, err := m.api_request(req)
+	result, err := m.requestAPI(req)
 	if err != nil {
 		return nil, err
 	}
@@ -1801,7 +1775,7 @@ func (m *Mega) Delete(node *Node, destroy bool) error {
 	if err != nil {
 		return err
 	}
-	_, err = m.api_request(req)
+	_, err = m.requestAPI(req)
 	if err != nil {
 		return err
 	}
@@ -1875,143 +1849,6 @@ func (m *Mega) processDeleteNode(evRaw []byte) error {
 	return nil
 }
 
-// Listen for server event notifications and play actions
-func (m *Mega) pollEvents() {
-	var err error
-	var resp *http.Response
-	sleepTime := minSleepTime // inital backoff time
-	for {
-		if err != nil {
-			m.debugf("pollEvents: error from server", err)
-			backOffSleep(&sleepTime)
-		} else {
-			// reset sleep time to minimum on success
-			sleepTime = minSleepTime
-		}
-
-		url := fmt.Sprintf("%s/sc?sn=%s&sid=%s", m.baseurl, m.ssn, m.sid)
-		resp, err = m.client.Post(url, "application/xml", nil)
-		if err != nil {
-			m.logf("pollEvents: Error fetching status: %s", err)
-			continue
-		}
-
-		if resp.StatusCode != 200 {
-			m.logf("pollEvents: Error from server: %s", resp.Status)
-			_ = resp.Body.Close()
-			continue
-		}
-
-		buf, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			m.logf("pollEvents: Error reading body: %v", err)
-			_ = resp.Body.Close()
-			continue
-		}
-		err = resp.Body.Close()
-		if err != nil {
-			m.logf("pollEvents: Error closing body: %v", err)
-			continue
-		}
-
-		// body is read and closed here
-
-		// First attempt to parse an array
-		var events Events
-		err = json.Unmarshal(buf, &events)
-		if err != nil {
-			// Try parsing as a lone error message
-			var emsg ErrorMsg
-			err = json.Unmarshal(buf, &emsg)
-			if err != nil {
-				m.logf("pollEvents: Bad response received from server: %s", buf)
-			} else {
-				err = parseError(emsg)
-				if err == EAGAIN {
-				} else if err != nil {
-					m.logf("pollEvents: Error received from server: %v", err)
-				}
-			}
-			continue
-		}
-
-		// if wait URL is set, then fetch it and continue - we
-		// don't expect anything else if we have a wait URL.
-		if events.W != "" {
-			m.waitEventsFire()
-			if len(events.E) > 0 {
-				m.logf("pollEvents: Unexpected event with w set: %s", buf)
-			}
-			resp, err = m.client.Get(events.W)
-			if err == nil {
-				_ = resp.Body.Close()
-			}
-			continue
-		}
-		m.ssn = events.Sn
-
-		// For each event in the array, parse it
-		for _, evRaw := range events.E {
-			// First attempt to unmarshal as an error message
-			var emsg ErrorMsg
-			err = json.Unmarshal(evRaw, &emsg)
-			if err == nil {
-				m.logf("pollEvents: Error message received %s", evRaw)
-				err = parseError(emsg)
-				if err != nil {
-					m.logf("pollEvents: Event from server was error: %v", err)
-				}
-				continue
-			}
-
-			// Now unmarshal as a generic event
-			var gev GenericEvent
-			err = json.Unmarshal(evRaw, &gev)
-			if err != nil {
-				m.logf("pollEvents: Couldn't parse event from server: %v: %s", err, evRaw)
-				continue
-			}
-			m.debugf("pollEvents: Parsing event %q: %s", gev.Cmd, evRaw)
-
-			// Work out what to do with the event
-			var process func([]byte) error
-			switch gev.Cmd {
-			case "t": // node addition
-				process = m.processAddNode
-			case "u": // node update
-				process = m.processUpdateNode
-			case "d": // node deletion
-				process = m.processDeleteNode
-			case "s", "s2": // share addition/update/revocation
-			case "c": // contact addition/update
-			case "k": // crypto key request
-			case "fa": // file attribute update
-			case "ua": // user attribute update
-			case "psts": // account updated
-			case "ipc": // incoming pending contact request (to us)
-			case "opc": // outgoing pending contact request (from us)
-			case "upci": // incoming pending contact request update (accept/deny/ignore)
-			case "upco": // outgoing pending contact request update (from them, accept/deny/ignore)
-			case "ph": // public links handles
-			case "se": // set email
-			case "mcc": // chat creation / peer's invitation / peer's removal
-			case "mcna": // granted / revoked access to a node
-			case "uac": // user access control
-			default:
-				m.debugf("pollEvents: Unknown message %q received: %s", gev.Cmd, evRaw)
-			}
-
-			// process the event if we can
-			if process != nil {
-				err := process(evRaw)
-				if err != nil {
-					m.logf("pollEvents: Error processing event %q '%s': %v", gev.Cmd, evRaw, err)
-				}
-			}
-		}
-	}
-}
-
 func (m *Mega) getLink(n *Node) (string, error) {
 	var msg [1]GetLinkMsg
 	var res [1]string
@@ -2023,7 +1860,7 @@ func (m *Mega) getLink(n *Node) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	result, err := m.api_request(req)
+	result, err := m.requestAPI(req)
 	if err != nil {
 		return "", err
 	}
